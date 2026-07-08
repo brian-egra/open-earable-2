@@ -106,6 +106,8 @@ void start_data_thread(void);
 
 void record_to_sd(bool active);
 
+void stream_to_ble(bool active);
+
 void set_sensor_queue(struct k_msgq *queue);
 
 int audio_datapath_aquire(struct data_fifo *fifo_rx);

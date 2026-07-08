@@ -189,6 +189,7 @@ static struct k_thread data_thread_data;
 static k_tid_t data_thread_id;
 
 bool _record_to_sd = false;
+bool _stream_ble = false;
 
 int _count = 0;
 
@@ -226,44 +227,73 @@ static void data_thread(void *arg1, void *arg2, void *arg3)
 
 			unsigned int logger_signaled;
 
-			if (_record_to_sd) {
+			if (_record_to_sd || _stream_ble) {
 				/* Decimate audio data from 48kHz to the desired sampling rate */
 				int16_t *audio_block = (int16_t *)(audio_item.data + (i * BLOCK_SIZE_BYTES));
 				uint32_t num_frames = BLOCK_SIZE_BYTES / sizeof(int16_t) / 2; /* stereo frames */
 
 				int decimated_frames = audio_datapath_decimator_process(audio_block, decimated_audio, num_frames);
-				
+
 				// If decimator returns 0 frames (e.g. during cleanup), skip processing
 				if (decimated_frames <= 0) {
 					continue;
 				}
 
-				struct sensor_msg audio_msg;
-	
-				audio_msg.sd = true;
-				audio_msg.stream = false;
-	
-				audio_msg.data.id = ID_MICRO;
-				audio_msg.data.time = time_stamp;
-
-				audio_msg.data.size = decimated_frames * 2 * sizeof(int16_t);
-
-				uint32_t data_size[2] = {
-					sizeof(audio_msg.data.id) + sizeof(audio_msg.data.size) + sizeof(audio_msg.data.time),
-					audio_msg.data.size
-				};
-
-				void *data_ptrs[2] = {
-					&audio_msg.data,
-					decimated_audio
-				};
-
+				int16_t *decimated_block = decimated_audio;
 				if (decimated_frames == num_frames) {
-					data_ptrs[1] = audio_block;
+					decimated_block = audio_block;
 				}
-	
-				if (decimated_frames > 0) {
-					sdlogger_write_data(&data_ptrs, data_size, 2);
+
+				if (_record_to_sd) {
+					struct sensor_msg audio_msg;
+
+					audio_msg.sd = true;
+					audio_msg.stream = false;
+
+					audio_msg.data.id = ID_MICRO;
+					audio_msg.data.time = time_stamp;
+
+					audio_msg.data.size = decimated_frames * 2 * sizeof(int16_t);
+
+					uint32_t data_size[2] = {
+						sizeof(audio_msg.data.id) + sizeof(audio_msg.data.size) + sizeof(audio_msg.data.time),
+						audio_msg.data.size
+					};
+
+					void *data_ptrs[2] = {
+						&audio_msg.data,
+						decimated_block
+					};
+
+					if (decimated_frames > 0) {
+						sdlogger_write_data(&data_ptrs, data_size, 2);
+					}
+				}
+
+				if (_stream_ble && sensor_queue != NULL) {
+					/* Chunk decimated stereo frames into sensor_msg payloads small
+					 * enough for the fixed-size sensor pipeline (38 bytes). Each
+					 * chunk carries an absolute timestamp derived from the block
+					 * timestamp and the decimated sample period. */
+					const uint32_t frames_per_chunk = SENSOR_DATA_FIXED_LENGTH / (2 * sizeof(int16_t));
+					uint32_t factor = num_frames / (uint32_t)decimated_frames;
+					uint64_t us_per_frame = (1000000ULL * factor) / 48000ULL;
+
+					struct sensor_msg ble_msg;
+					ble_msg.sd = false;
+					ble_msg.stream = true;
+					ble_msg.data.id = ID_MICRO;
+
+					for (uint32_t f = 0; f < (uint32_t)decimated_frames; f += frames_per_chunk) {
+						uint32_t n = MIN(frames_per_chunk, (uint32_t)decimated_frames - f);
+						ble_msg.data.time = time_stamp + (uint64_t)f * us_per_frame;
+						ble_msg.data.size = n * 2 * sizeof(int16_t);
+						memcpy(ble_msg.data.data, decimated_block + f * 2, ble_msg.data.size);
+						if (k_msgq_put(sensor_queue, &ble_msg, K_NO_WAIT) != 0) {
+							/* drop chunk if the queue is full; audio must not stall */
+							break;
+						}
+					}
 				}
 			}
 
@@ -290,6 +320,10 @@ void set_sensor_queue(struct k_msgq *queue)
 
 void record_to_sd(bool active) {
 	_record_to_sd = active;
+}
+
+void stream_to_ble(bool active) {
+	_stream_ble = active;
 }
 
 void audio_datapath_stop_recording(void) {

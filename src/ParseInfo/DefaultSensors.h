@@ -141,11 +141,11 @@ SensorScheme defaultSensors[SENSOR_COUNT] = {
         .groupCount = MICRO_GROUP_COUNT,
         .groups = microGroups,
         .configOptions = {
-            .availableOptions = DATA_STORAGE | FREQUENCIES_DEFINED,
+            .availableOptions = DATA_STREAMING | DATA_STORAGE | FREQUENCIES_DEFINED,
             .frequencyOptions = {
                 .frequencyCount = sizeof(Microphone::sample_rates.reg_vals),
                 .defaultFrequencyIndex = 8,
-                .maxBleFrequencyIndex = 8,
+                .maxBleFrequencyIndex = 4,
                 .frequencies = Microphone::sample_rates.sample_rates,
             },
         },

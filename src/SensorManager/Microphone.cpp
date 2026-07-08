@@ -67,7 +67,8 @@ void Microphone::start(int sample_rate_idx) {
 
 	audio_datapath_decimator_init(sample_rates.reg_vals[sample_rate_idx]);
 
-	record_to_sd(true);
+	record_to_sd(_sd_logging);
+	stream_to_ble(_ble_stream);
 
 	_running = true;
 }
@@ -79,6 +80,7 @@ void Microphone::stop() {
 	if (!_running) return;
 
 	record_to_sd(false);
+	stream_to_ble(false);
 
 	audio_datapath_release();
 
