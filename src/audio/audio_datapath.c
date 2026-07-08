@@ -191,7 +191,7 @@ static k_tid_t data_thread_id;
 bool _record_to_sd = false;
 bool _stream_ble = false;
 
-/* BLE mic chunk accumulator: 9 stereo frames = 36 bytes <= SENSOR_DATA_FIXED_LENGTH */
+/* BLE mic chunk accumulator: fills one max-size sensor payload with stereo frames */
 static int16_t _ble_chunk_buf[(SENSOR_DATA_FIXED_LENGTH / (2 * sizeof(int16_t))) * 2];
 static uint32_t _ble_chunk_fill;
 static uint64_t _ble_chunk_ts;
