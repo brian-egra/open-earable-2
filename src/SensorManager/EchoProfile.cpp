@@ -12,6 +12,7 @@ extern "C" {
 #endif
 
 #include <data_fifo.h>
+extern void init_fifo();
 
 #ifdef __cplusplus
 }
@@ -39,6 +40,8 @@ bool EchoProfile::init(struct k_msgq * queue) {
     sensor_queue = queue;
 
     set_sensor_queue(queue);
+
+    init_fifo();
 
     return true;
 }
