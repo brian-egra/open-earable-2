@@ -191,6 +191,11 @@ static k_tid_t data_thread_id;
 bool _record_to_sd = false;
 bool _stream_ble = false;
 
+/* BLE mic chunk accumulator: 9 stereo frames = 36 bytes <= SENSOR_DATA_FIXED_LENGTH */
+static int16_t _ble_chunk_buf[(SENSOR_DATA_FIXED_LENGTH / (2 * sizeof(int16_t))) * 2];
+static uint32_t _ble_chunk_fill;
+static uint64_t _ble_chunk_ts;
+
 int _count = 0;
 
 extern struct k_poll_signal encoder_sig;
@@ -271,27 +276,34 @@ static void data_thread(void *arg1, void *arg2, void *arg3)
 				}
 
 				if (_stream_ble && sensor_queue != NULL) {
-					/* Chunk decimated stereo frames into sensor_msg payloads small
-					 * enough for the fixed-size sensor pipeline (38 bytes). Each
-					 * chunk carries an absolute timestamp derived from the block
-					 * timestamp and the decimated sample period. */
+					/* Accumulate decimated stereo frames into uniform fixed-size
+					 * chunks (9 frames = 36 bytes), carrying remainders across
+					 * audio blocks. Uniform payload sizes let the GATT layer
+					 * batch several chunks per notification, which is required
+					 * to fit within the notification rate budget. */
 					const uint32_t frames_per_chunk = SENSOR_DATA_FIXED_LENGTH / (2 * sizeof(int16_t));
 					uint32_t factor = num_frames / (uint32_t)decimated_frames;
 					uint64_t us_per_frame = (1000000ULL * factor) / 48000ULL;
 
-					struct sensor_msg ble_msg;
-					ble_msg.sd = false;
-					ble_msg.stream = true;
-					ble_msg.data.id = ID_MICRO;
+					for (uint32_t f = 0; f < (uint32_t)decimated_frames; f++) {
+						if (_ble_chunk_fill == 0) {
+							_ble_chunk_ts = time_stamp + (uint64_t)f * us_per_frame;
+						}
+						memcpy(&_ble_chunk_buf[_ble_chunk_fill * 2],
+						       decimated_block + f * 2, 2 * sizeof(int16_t));
+						_ble_chunk_fill++;
 
-					for (uint32_t f = 0; f < (uint32_t)decimated_frames; f += frames_per_chunk) {
-						uint32_t n = MIN(frames_per_chunk, (uint32_t)decimated_frames - f);
-						ble_msg.data.time = time_stamp + (uint64_t)f * us_per_frame;
-						ble_msg.data.size = n * 2 * sizeof(int16_t);
-						memcpy(ble_msg.data.data, decimated_block + f * 2, ble_msg.data.size);
-						if (k_msgq_put(sensor_queue, &ble_msg, K_NO_WAIT) != 0) {
+						if (_ble_chunk_fill == frames_per_chunk) {
+							struct sensor_msg ble_msg;
+							ble_msg.sd = false;
+							ble_msg.stream = true;
+							ble_msg.data.id = ID_MICRO;
+							ble_msg.data.time = _ble_chunk_ts;
+							ble_msg.data.size = frames_per_chunk * 2 * sizeof(int16_t);
+							memcpy(ble_msg.data.data, _ble_chunk_buf, ble_msg.data.size);
 							/* drop chunk if the queue is full; audio must not stall */
-							break;
+							k_msgq_put(sensor_queue, &ble_msg, K_NO_WAIT);
+							_ble_chunk_fill = 0;
 						}
 					}
 				}
@@ -323,6 +335,7 @@ void record_to_sd(bool active) {
 }
 
 void stream_to_ble(bool active) {
+	_ble_chunk_fill = 0;
 	_stream_ble = active;
 }
 
