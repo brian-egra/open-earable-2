@@ -13,6 +13,7 @@
 #include "Temp.h"
 #include "BoneConduction.h"
 #include "Microphone.h"
+#include "EchoProfile.h"
 
 #include "openearable_common.h"
 #include "StateIndicator.h"
@@ -170,6 +171,8 @@ EdgeMlSensor * get_sensor(enum sensor_id id) {
 		return &(BoneConduction::sensor);
 	case ID_MICRO:
 		return &(Microphone::sensor);
+	case ID_ECHO:
+		return &(EchoProfile::sensor);
 	default:
 		return NULL;
 	}
