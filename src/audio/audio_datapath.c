@@ -191,12 +191,72 @@ static k_tid_t data_thread_id;
 bool _record_to_sd = false;
 bool _stream_ble = false;
 
-/* BLE mic chunk accumulator: fills one max-size sensor payload with mono
- * (inner-mic) frames. BLE streaming is mono to fit the radio budget; SD
- * recordings remain stereo. */
-static int16_t _ble_chunk_buf[SENSOR_DATA_FIXED_LENGTH / sizeof(int16_t)];
-static uint32_t _ble_chunk_fill;
+/* BLE mic streaming: mono inner-mic frames, IMA-ADPCM compressed (4 bits per
+ * sample) so 8 kHz audio fits in ~4 KB/s. Each fixed-size chunk is
+ * independently decodable: [int16 predictor, uint8 step index, 223 bytes of
+ * nibbles = 446 samples]. SD recordings remain stereo uncompressed. */
+#define ADPCM_HDR 3
+#define ADPCM_DATA_BYTES (SENSOR_DATA_FIXED_LENGTH - ADPCM_HDR)
+#define ADPCM_SAMPLES_PER_CHUNK (ADPCM_DATA_BYTES * 2)
+
+static const int8_t ima_index_table[16] = {
+	-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8
+};
+static const int16_t ima_step_table[89] = {
+	7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41,
+	45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190,
+	209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724,
+	796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272,
+	2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132,
+	7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500,
+	20350, 22385, 24623, 27086, 29794, 32767
+};
+
+static int16_t _adpcm_pred;
+static int8_t _adpcm_index;
+static uint8_t _ble_chunk_buf[SENSOR_DATA_FIXED_LENGTH];
+static uint32_t _ble_chunk_nibbles;
 static uint64_t _ble_chunk_ts;
+
+static uint8_t adpcm_encode_sample(int16_t s)
+{
+	int step = ima_step_table[_adpcm_index];
+	int diff = (int)s - _adpcm_pred;
+	uint8_t code = 0;
+
+	if (diff < 0) {
+		code = 8;
+		diff = -diff;
+	}
+	if (diff >= step) {
+		code |= 4;
+		diff -= step;
+	}
+	if (diff >= (step >> 1)) {
+		code |= 2;
+		diff -= step >> 1;
+	}
+	if (diff >= (step >> 2)) {
+		code |= 1;
+	}
+
+	int diffq = step >> 3;
+	if (code & 4) diffq += step;
+	if (code & 2) diffq += step >> 1;
+	if (code & 1) diffq += step >> 2;
+
+	int pred = _adpcm_pred + ((code & 8) ? -diffq : diffq);
+	if (pred > 32767) pred = 32767;
+	if (pred < -32768) pred = -32768;
+	_adpcm_pred = (int16_t)pred;
+
+	int idx = _adpcm_index + ima_index_table[code];
+	if (idx < 0) idx = 0;
+	if (idx > 88) idx = 88;
+	_adpcm_index = (int8_t)idx;
+
+	return code;
+}
 
 /* ---- Ultrasound chirp + echo profiles (EarIO-style active sensing) ---- */
 #define CHIRP_LEN 480 /* one 10 ms FMCW chirp @ 48 kHz, looped seamlessly */
@@ -364,10 +424,12 @@ static void data_thread(void *arg1, void *arg2, void *arg3)
 					echo_msg.stream = true;
 					echo_msg.data.id = ID_ECHO;
 					echo_msg.data.time = echo_win_ts;
-					echo_msg.data.size = ECHO_BINS;
+					echo_msg.data.size = ECHO_BINS * sizeof(uint16_t);
 					for (int b = 0; b < ECHO_BINS; b++) {
-						echo_msg.data.data[b] =
-							echo_log_compress(echo_acc[b] / _echo_avg);
+						uint32_t v = echo_acc[b] / _echo_avg;
+						uint16_t q = (v > 0xffff) ? 0xffff : (uint16_t)v;
+						echo_msg.data.data[2 * b] = (uint8_t)(q & 0xff);
+						echo_msg.data.data[2 * b + 1] = (uint8_t)(q >> 8);
 						echo_acc[b] = 0;
 					}
 					echo_acc_cnt = 0;
@@ -420,33 +482,42 @@ static void data_thread(void *arg1, void *arg2, void *arg3)
 				}
 
 				if (_stream_ble && sensor_queue != NULL) {
-					/* Accumulate decimated INNER-mic (mono) frames into uniform
-					 * max-size chunks, carrying remainders across audio blocks.
-					 * Uniform payload sizes let the GATT layer batch several
-					 * chunks per notification, and mono halves the radio load
-					 * so mic and echo profiles can stream together. */
-					const uint32_t frames_per_chunk = SENSOR_DATA_FIXED_LENGTH / sizeof(int16_t);
+					/* ADPCM-encode decimated INNER-mic frames into uniform,
+					 * independently decodable chunks. Uniform payload sizes
+					 * let the GATT layer batch notifications; 4-bit samples
+					 * halve the load twice over so 8 kHz mic audio and echo
+					 * profiles stream together. */
 					uint32_t factor = num_frames / (uint32_t)decimated_frames;
 					uint64_t us_per_frame = (1000000ULL * factor) / 48000ULL;
 
 					for (uint32_t f = 0; f < (uint32_t)decimated_frames; f++) {
-						if (_ble_chunk_fill == 0) {
+						if (_ble_chunk_nibbles == 0) {
 							_ble_chunk_ts = time_stamp + (uint64_t)f * us_per_frame;
+							_ble_chunk_buf[0] = (uint8_t)(_adpcm_pred & 0xff);
+							_ble_chunk_buf[1] = (uint8_t)((_adpcm_pred >> 8) & 0xff);
+							_ble_chunk_buf[2] = (uint8_t)_adpcm_index;
+							memset(&_ble_chunk_buf[ADPCM_HDR], 0, ADPCM_DATA_BYTES);
 						}
-						_ble_chunk_buf[_ble_chunk_fill] = decimated_block[f * 2];
-						_ble_chunk_fill++;
+						uint8_t code = adpcm_encode_sample(decimated_block[f * 2]);
+						uint32_t byte_i = ADPCM_HDR + (_ble_chunk_nibbles >> 1);
+						if (_ble_chunk_nibbles & 1) {
+							_ble_chunk_buf[byte_i] |= code << 4;
+						} else {
+							_ble_chunk_buf[byte_i] = code;
+						}
+						_ble_chunk_nibbles++;
 
-						if (_ble_chunk_fill == frames_per_chunk) {
+						if (_ble_chunk_nibbles == ADPCM_SAMPLES_PER_CHUNK) {
 							struct sensor_msg ble_msg;
 							ble_msg.sd = false;
 							ble_msg.stream = true;
 							ble_msg.data.id = ID_MICRO;
 							ble_msg.data.time = _ble_chunk_ts;
-							ble_msg.data.size = frames_per_chunk * sizeof(int16_t);
-							memcpy(ble_msg.data.data, _ble_chunk_buf, ble_msg.data.size);
+							ble_msg.data.size = SENSOR_DATA_FIXED_LENGTH;
+							memcpy(ble_msg.data.data, _ble_chunk_buf, SENSOR_DATA_FIXED_LENGTH);
 							/* drop chunk if the queue is full; audio must not stall */
 							k_msgq_put(sensor_queue, &ble_msg, K_NO_WAIT);
-							_ble_chunk_fill = 0;
+							_ble_chunk_nibbles = 0;
 						}
 					}
 				}
@@ -478,7 +549,9 @@ void record_to_sd(bool active) {
 }
 
 void stream_to_ble(bool active) {
-	_ble_chunk_fill = 0;
+	_ble_chunk_nibbles = 0;
+	_adpcm_pred = 0;
+	_adpcm_index = 0;
 	_stream_ble = active;
 }
 

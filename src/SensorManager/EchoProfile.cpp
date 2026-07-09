@@ -26,12 +26,12 @@ extern struct data_fifo fifo_rx;
 EchoProfile EchoProfile::sensor;
 
 /* reg_vals = number of 10 ms chirp frames averaged per emitted profile */
-const SampleRateSetting<2> EchoProfile::sample_rates = {
-    { 2, 1 },
+const SampleRateSetting<3> EchoProfile::sample_rates = {
+    { 4, 2, 1 },
 
-    { 50.0, 100.0 },
+    { 25.0, 50.0, 100.0 },
 
-    { 50.0, 100.0 }
+    { 25.0, 50.0, 100.0 }
 };
 
 bool EchoProfile::init(struct k_msgq * queue) {

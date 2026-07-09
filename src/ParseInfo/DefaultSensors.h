@@ -121,7 +121,7 @@ SensorComponentGroup baroGroups[BARO_GROUP_COUNT] = {
 
 #define ECHO_COMPONENT_COUNT 1
 SensorComponent echoComponents[ECHO_COMPONENT_COUNT] = {
-    { .name = "BIN", .unit = "log2", .parseType = PARSE_TYPE_UINT8 },
+    { .name = "BIN", .unit = "mag", .parseType = PARSE_TYPE_UINT16 },
 };
 
 #define ECHO_GROUP_COUNT 1
@@ -233,7 +233,7 @@ SensorScheme defaultSensors[SENSOR_COUNT] = {
             .frequencyOptions = {
                 .frequencyCount = sizeof(EchoProfile::sample_rates.reg_vals),
                 .defaultFrequencyIndex = 0,
-                .maxBleFrequencyIndex = 1,
+                .maxBleFrequencyIndex = 2,
                 .frequencies = EchoProfile::sample_rates.sample_rates,
             },
         },
