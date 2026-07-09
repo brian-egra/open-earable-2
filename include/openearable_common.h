@@ -10,7 +10,7 @@
 #define ZBUS_READ_TIMEOUT_MS	K_MSEC(100)
 #define ZBUS_ADD_OBS_TIMEOUT_MS K_MSEC(200)
 
-#define SENSOR_DATA_FIXED_LENGTH 38
+#define SENSOR_DATA_FIXED_LENGTH 226
 
 
 #define millis() k_cyc_to_ms_floor64(k_uptime_ticks())
@@ -84,6 +84,7 @@ enum sensor_id {
 	ID_IMU=0,
 	ID_TEMP_BARO=1,
 	ID_MICRO=2,
+	ID_ECHO=3,
 	ID_PPG=4,
 	ID_PULSOX=5,
 	ID_OPTTEMP=6,

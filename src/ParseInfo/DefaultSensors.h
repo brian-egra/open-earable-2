@@ -12,6 +12,7 @@
 #include "../SensorManager/Temp.h"
 #include "../SensorManager/BoneConduction.h"
 #include "../SensorManager/Microphone.h"
+#include "../SensorManager/EchoProfile.h"
 
 
 // ============= Microphones =============
@@ -116,9 +117,21 @@ SensorComponentGroup baroGroups[BARO_GROUP_COUNT] = {
     { .name = "BAROMETER", .componentCount = BARO_PRESSURE_COUNT, .components = baroPressureComponents },
 };
 
+// ============= Ultrasound Echo =============
+
+#define ECHO_COMPONENT_COUNT 1
+SensorComponent echoComponents[ECHO_COMPONENT_COUNT] = {
+    { .name = "BIN", .unit = "mag", .parseType = PARSE_TYPE_UINT16 },
+};
+
+#define ECHO_GROUP_COUNT 1
+SensorComponentGroup echoGroups[ECHO_GROUP_COUNT] = {
+    { .name = "ECHO", .componentCount = ECHO_COMPONENT_COUNT, .components = echoComponents },
+};
+
 // ============= Sensors =============
 
-#define SENSOR_COUNT 6
+#define SENSOR_COUNT 7
 SensorScheme defaultSensors[SENSOR_COUNT] = {
     {
         .name = "9-Axis IMU",
@@ -141,11 +154,11 @@ SensorScheme defaultSensors[SENSOR_COUNT] = {
         .groupCount = MICRO_GROUP_COUNT,
         .groups = microGroups,
         .configOptions = {
-            .availableOptions = DATA_STORAGE | FREQUENCIES_DEFINED,
+            .availableOptions = DATA_STREAMING | DATA_STORAGE | FREQUENCIES_DEFINED,
             .frequencyOptions = {
                 .frequencyCount = sizeof(Microphone::sample_rates.reg_vals),
                 .defaultFrequencyIndex = 8,
-                .maxBleFrequencyIndex = 8,
+                .maxBleFrequencyIndex = 4,
                 .frequencies = Microphone::sample_rates.sample_rates,
             },
         },
@@ -210,11 +223,26 @@ SensorScheme defaultSensors[SENSOR_COUNT] = {
             },
         }, 
     },
+    {
+        .name = "Ultrasound Echo Profile",
+        .id = ID_ECHO,
+        .groupCount = ECHO_GROUP_COUNT,
+        .groups = echoGroups,
+        .configOptions = {
+            .availableOptions = DATA_STREAMING | FREQUENCIES_DEFINED,
+            .frequencyOptions = {
+                .frequencyCount = sizeof(EchoProfile::sample_rates.reg_vals),
+                .defaultFrequencyIndex = 0,
+                .maxBleFrequencyIndex = 2,
+                .frequencies = EchoProfile::sample_rates.sample_rates,
+            },
+        },
+    },
 };
 
 ParseInfoScheme defaultSensorIds = {
     .sensorCount = SENSOR_COUNT,
-    .sensorIds = (uint8_t[]){ ID_IMU, ID_PPG, ID_OPTTEMP, ID_TEMP_BARO, ID_BONE_CONDUCTION, ID_MICRO },
+    .sensorIds = (uint8_t[]){ ID_IMU, ID_PPG, ID_OPTTEMP, ID_TEMP_BARO, ID_BONE_CONDUCTION, ID_MICRO, ID_ECHO },
 };
 
 #endif // _DEFAULT_SENSORS_H

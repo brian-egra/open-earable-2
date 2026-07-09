@@ -189,6 +189,182 @@ static struct k_thread data_thread_data;
 static k_tid_t data_thread_id;
 
 bool _record_to_sd = false;
+bool _stream_ble = false;
+
+/* BLE mic streaming: mono inner-mic frames, IMA-ADPCM compressed (4 bits per
+ * sample) so 8 kHz audio fits in ~4 KB/s. Each fixed-size chunk is
+ * independently decodable: [int16 predictor, uint8 step index, 223 bytes of
+ * nibbles = 446 samples]. SD recordings remain stereo uncompressed. */
+#define ADPCM_HDR 3
+#define ADPCM_DATA_BYTES (SENSOR_DATA_FIXED_LENGTH - ADPCM_HDR)
+#define ADPCM_SAMPLES_PER_CHUNK (ADPCM_DATA_BYTES * 2)
+
+static const int8_t ima_index_table[16] = {
+	-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8
+};
+static const int16_t ima_step_table[89] = {
+	7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41,
+	45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190,
+	209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724,
+	796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272,
+	2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132,
+	7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500,
+	20350, 22385, 24623, 27086, 29794, 32767
+};
+
+static int16_t _adpcm_pred;
+static int8_t _adpcm_index;
+static uint8_t _ble_chunk_buf[SENSOR_DATA_FIXED_LENGTH];
+static uint32_t _ble_chunk_nibbles;
+static uint64_t _ble_chunk_ts;
+
+static uint8_t adpcm_encode_sample(int16_t s)
+{
+	int step = ima_step_table[_adpcm_index];
+	int diff = (int)s - _adpcm_pred;
+	uint8_t code = 0;
+
+	if (diff < 0) {
+		code = 8;
+		diff = -diff;
+	}
+	if (diff >= step) {
+		code |= 4;
+		diff -= step;
+	}
+	if (diff >= (step >> 1)) {
+		code |= 2;
+		diff -= step >> 1;
+	}
+	if (diff >= (step >> 2)) {
+		code |= 1;
+	}
+
+	int diffq = step >> 3;
+	if (code & 4) diffq += step;
+	if (code & 2) diffq += step >> 1;
+	if (code & 1) diffq += step >> 2;
+
+	int pred = _adpcm_pred + ((code & 8) ? -diffq : diffq);
+	if (pred > 32767) pred = 32767;
+	if (pred < -32768) pred = -32768;
+	_adpcm_pred = (int16_t)pred;
+
+	int idx = _adpcm_index + ima_index_table[code];
+	if (idx < 0) idx = 0;
+	if (idx > 88) idx = 88;
+	_adpcm_index = (int8_t)idx;
+
+	return code;
+}
+
+/* ---- Ultrasound chirp + echo profiles (EarIO-style active sensing) ---- */
+#define CHIRP_LEN 480 /* one 10 ms FMCW chirp @ 48 kHz, looped seamlessly */
+#define ECHO_BINS 64
+#define CHIRP_F0_HZ 18000.0f
+#define CHIRP_F1_HZ 21000.0f
+#define CHIRP_AMPL 11000
+#define CHIRP_FADE 24
+
+static int16_t chirp_buf[CHIRP_LEN];
+/* doubled quadrature templates so lagged correlation needs no modulo */
+static int16_t chirp_tmpl_i[2 * CHIRP_LEN];
+static int16_t chirp_tmpl_q[2 * CHIRP_LEN];
+static bool chirp_tables_ready = false;
+static bool _chirp_active = false;
+
+static bool _echo_stream = false;
+static uint8_t _echo_avg = 2; /* chirp frames averaged per emitted profile */
+static int16_t echo_win[CHIRP_LEN];
+static uint32_t echo_win_fill = 0;
+static uint32_t echo_acc[ECHO_BINS];
+static uint8_t echo_acc_cnt = 0;
+static uint64_t echo_win_ts = 0;
+
+static void chirp_tables_init(void)
+{
+	if (chirp_tables_ready) {
+		return;
+	}
+	const float fs = 48000.0f;
+	const float T = (float)CHIRP_LEN / fs;
+	const float slope = (CHIRP_F1_HZ - CHIRP_F0_HZ) / T;
+
+	for (int n = 0; n < CHIRP_LEN; n++) {
+		float t = (float)n / fs;
+		float ph = 2.0f * PI * (CHIRP_F0_HZ * t + 0.5f * slope * t * t);
+		/* raised-cosine fade at the loop seam to avoid audible clicks */
+		float w = 1.0f;
+		if (n < CHIRP_FADE) {
+			w = 0.5f * (1.0f - arm_cos_f32(PI * (float)n / (float)CHIRP_FADE));
+		} else if (n >= CHIRP_LEN - CHIRP_FADE) {
+			w = 0.5f * (1.0f - arm_cos_f32(PI * (float)(CHIRP_LEN - 1 - n) /
+						       (float)CHIRP_FADE));
+		}
+		float ci = arm_cos_f32(ph);
+		float cq = arm_sin_f32(ph);
+		chirp_buf[n] = (int16_t)((float)CHIRP_AMPL * w * ci);
+		chirp_tmpl_i[n] = (int16_t)(16384.0f * w * ci);
+		chirp_tmpl_q[n] = (int16_t)(16384.0f * w * cq);
+	}
+	memcpy(&chirp_tmpl_i[CHIRP_LEN], chirp_tmpl_i, sizeof(int16_t) * CHIRP_LEN);
+	memcpy(&chirp_tmpl_q[CHIRP_LEN], chirp_tmpl_q, sizeof(int16_t) * CHIRP_LEN);
+	chirp_tables_ready = true;
+}
+
+void chirp_set(bool active)
+{
+	if (active) {
+		chirp_tables_init();
+	}
+	_chirp_active = active;
+}
+
+void echo_stream_set(bool active, uint8_t profiles_avg)
+{
+	if (active) {
+		chirp_tables_init();
+	}
+	_echo_avg = profiles_avg ? profiles_avg : 1;
+	echo_win_fill = 0;
+	echo_acc_cnt = 0;
+	memset(echo_acc, 0, sizeof(echo_acc));
+	_echo_stream = active;
+}
+
+/* Quadrature matched filter of one completed 480-sample window against the
+ * chirp template; accumulates ECHO_BINS lag magnitudes into echo_acc. */
+static void echo_process_window(void)
+{
+	for (int lag = 0; lag < ECHO_BINS; lag++) {
+		int64_t acc_i = 0;
+		int64_t acc_q = 0;
+		const int16_t *ti = &chirp_tmpl_i[CHIRP_LEN - lag];
+		const int16_t *tq = &chirp_tmpl_q[CHIRP_LEN - lag];
+
+		for (int n = 0; n < CHIRP_LEN; n++) {
+			acc_i += (int32_t)echo_win[n] * ti[n];
+			acc_q += (int32_t)echo_win[n] * tq[n];
+		}
+		uint32_t ai = (uint32_t)((acc_i < 0 ? -acc_i : acc_i) >> 15);
+		uint32_t aq = (uint32_t)((acc_q < 0 ? -acc_q : acc_q) >> 15);
+		/* alpha-max + beta/2-min magnitude approximation */
+		uint32_t mag = (ai > aq) ? (ai + (aq >> 1)) : (aq + (ai >> 1));
+		echo_acc[lag] += mag;
+	}
+}
+
+/* 8*log2(v) compression to one byte */
+static uint8_t echo_log_compress(uint32_t v)
+{
+	if (v == 0) {
+		return 0;
+	}
+	int msb = 31 - __builtin_clz(v);
+	uint32_t frac = (msb >= 3) ? ((v >> (msb - 3)) & 0x7) : 0;
+	uint32_t code = (uint32_t)msb * 8 + frac;
+	return (code > 255) ? 255 : (uint8_t)code;
+}
 
 int _count = 0;
 
@@ -226,44 +402,124 @@ static void data_thread(void *arg1, void *arg2, void *arg3)
 
 			unsigned int logger_signaled;
 
-			if (_record_to_sd) {
+			if (_echo_stream && sensor_queue != NULL) {
+				int16_t *echo_blk = (int16_t *)(audio_item.data + (i * BLOCK_SIZE_BYTES));
+				uint32_t echo_frames = BLOCK_SIZE_BYTES / sizeof(int16_t) / 2;
+
+				for (uint32_t f = 0; f < echo_frames; f++) {
+					if (echo_win_fill == 0) {
+						echo_win_ts = time_stamp;
+					}
+					echo_win[echo_win_fill++] = echo_blk[2 * f]; /* inner mic */
+					if (echo_win_fill < CHIRP_LEN) {
+						continue;
+					}
+					echo_win_fill = 0;
+					echo_process_window();
+					if (++echo_acc_cnt < _echo_avg) {
+						continue;
+					}
+					struct sensor_msg echo_msg;
+					echo_msg.sd = false;
+					echo_msg.stream = true;
+					echo_msg.data.id = ID_ECHO;
+					echo_msg.data.time = echo_win_ts;
+					echo_msg.data.size = ECHO_BINS * sizeof(uint16_t);
+					for (int b = 0; b < ECHO_BINS; b++) {
+						uint32_t v = echo_acc[b] / _echo_avg;
+						uint16_t q = (v > 0xffff) ? 0xffff : (uint16_t)v;
+						echo_msg.data.data[2 * b] = (uint8_t)(q & 0xff);
+						echo_msg.data.data[2 * b + 1] = (uint8_t)(q >> 8);
+						echo_acc[b] = 0;
+					}
+					echo_acc_cnt = 0;
+					/* drop profile if the queue is full; audio must not stall */
+					k_msgq_put(sensor_queue, &echo_msg, K_NO_WAIT);
+				}
+			}
+
+			if (_record_to_sd || _stream_ble) {
 				/* Decimate audio data from 48kHz to the desired sampling rate */
 				int16_t *audio_block = (int16_t *)(audio_item.data + (i * BLOCK_SIZE_BYTES));
 				uint32_t num_frames = BLOCK_SIZE_BYTES / sizeof(int16_t) / 2; /* stereo frames */
 
 				int decimated_frames = audio_datapath_decimator_process(audio_block, decimated_audio, num_frames);
-				
+
 				// If decimator returns 0 frames (e.g. during cleanup), skip processing
 				if (decimated_frames <= 0) {
 					continue;
 				}
 
-				struct sensor_msg audio_msg;
-	
-				audio_msg.sd = true;
-				audio_msg.stream = false;
-	
-				audio_msg.data.id = ID_MICRO;
-				audio_msg.data.time = time_stamp;
-
-				audio_msg.data.size = decimated_frames * 2 * sizeof(int16_t);
-
-				uint32_t data_size[2] = {
-					sizeof(audio_msg.data.id) + sizeof(audio_msg.data.size) + sizeof(audio_msg.data.time),
-					audio_msg.data.size
-				};
-
-				void *data_ptrs[2] = {
-					&audio_msg.data,
-					decimated_audio
-				};
-
+				int16_t *decimated_block = decimated_audio;
 				if (decimated_frames == num_frames) {
-					data_ptrs[1] = audio_block;
+					decimated_block = audio_block;
 				}
-	
-				if (decimated_frames > 0) {
-					sdlogger_write_data(&data_ptrs, data_size, 2);
+
+				if (_record_to_sd) {
+					struct sensor_msg audio_msg;
+
+					audio_msg.sd = true;
+					audio_msg.stream = false;
+
+					audio_msg.data.id = ID_MICRO;
+					audio_msg.data.time = time_stamp;
+
+					audio_msg.data.size = decimated_frames * 2 * sizeof(int16_t);
+
+					uint32_t data_size[2] = {
+						sizeof(audio_msg.data.id) + sizeof(audio_msg.data.size) + sizeof(audio_msg.data.time),
+						audio_msg.data.size
+					};
+
+					void *data_ptrs[2] = {
+						&audio_msg.data,
+						decimated_block
+					};
+
+					if (decimated_frames > 0) {
+						sdlogger_write_data(&data_ptrs, data_size, 2);
+					}
+				}
+
+				if (_stream_ble && sensor_queue != NULL) {
+					/* ADPCM-encode decimated INNER-mic frames into uniform,
+					 * independently decodable chunks. Uniform payload sizes
+					 * let the GATT layer batch notifications; 4-bit samples
+					 * halve the load twice over so 8 kHz mic audio and echo
+					 * profiles stream together. */
+					uint32_t factor = num_frames / (uint32_t)decimated_frames;
+					uint64_t us_per_frame = (1000000ULL * factor) / 48000ULL;
+
+					for (uint32_t f = 0; f < (uint32_t)decimated_frames; f++) {
+						if (_ble_chunk_nibbles == 0) {
+							_ble_chunk_ts = time_stamp + (uint64_t)f * us_per_frame;
+							_ble_chunk_buf[0] = (uint8_t)(_adpcm_pred & 0xff);
+							_ble_chunk_buf[1] = (uint8_t)((_adpcm_pred >> 8) & 0xff);
+							_ble_chunk_buf[2] = (uint8_t)_adpcm_index;
+							memset(&_ble_chunk_buf[ADPCM_HDR], 0, ADPCM_DATA_BYTES);
+						}
+						uint8_t code = adpcm_encode_sample(decimated_block[f * 2]);
+						uint32_t byte_i = ADPCM_HDR + (_ble_chunk_nibbles >> 1);
+						if (_ble_chunk_nibbles & 1) {
+							_ble_chunk_buf[byte_i] |= code << 4;
+						} else {
+							_ble_chunk_buf[byte_i] = code;
+						}
+						_ble_chunk_nibbles++;
+
+						if (_ble_chunk_nibbles == ADPCM_SAMPLES_PER_CHUNK) {
+							struct sensor_msg ble_msg;
+							ble_msg.sd = false;
+							ble_msg.stream = true;
+							ble_msg.data.id = ID_MICRO;
+							ble_msg.data.time = _ble_chunk_ts;
+							ble_msg.data.size = SENSOR_DATA_FIXED_LENGTH;
+							memcpy(ble_msg.data.data, _ble_chunk_buf, SENSOR_DATA_FIXED_LENGTH);
+							/* drop chunk if the queue is full; audio must not stall */
+							k_msgq_put(sensor_queue, &ble_msg, K_NO_WAIT);
+							_ble_chunk_nibbles = 0;
+						}
+					}
 				}
 			}
 
@@ -290,6 +546,13 @@ void set_sensor_queue(struct k_msgq *queue)
 
 void record_to_sd(bool active) {
 	_record_to_sd = active;
+}
+
+void stream_to_ble(bool active) {
+	_ble_chunk_nibbles = 0;
+	_adpcm_pred = 0;
+	_adpcm_index = 0;
+	_stream_ble = active;
 }
 
 void audio_datapath_stop_recording(void) {
@@ -716,6 +979,24 @@ static void tone_mix(uint8_t *tx_buf)
 	ERR_CHK(ret);
 }
 
+/* Mix the looping ultrasound chirp into the outgoing I2S block. The static
+ * position keeps the chirp phase-continuous across blocks so the echo
+ * correlator sees a fixed TX phase per 480-sample window. */
+static void chirp_mix(uint8_t *tx_buf)
+{
+	int ret;
+	int8_t chirp_buf_continuous[BLK_MONO_SIZE_OCTETS];
+	static uint32_t chirp_pos;
+
+	ret = contin_array_create(chirp_buf_continuous, BLK_MONO_SIZE_OCTETS, (char *)chirp_buf,
+				  sizeof(chirp_buf), &chirp_pos);
+	ERR_CHK(ret);
+
+	ret = pcm_mix(tx_buf, BLK_STEREO_SIZE_OCTETS, chirp_buf_continuous, BLK_MONO_SIZE_OCTETS,
+		      B_MONO_INTO_A_STEREO_L);
+	ERR_CHK(ret);
+}
+
 /* Alternate-buffers used when there is no active audio stream.
  * Used interchangeably by I2S.
  */
@@ -845,6 +1126,10 @@ static void audio_datapath_i2s_blk_complete(uint32_t frame_start_ts_us, uint32_t
 
 			if (tone_active) {
 				tone_mix(tx_buf);
+			}
+
+			if (_chirp_active) {
+				chirp_mix(tx_buf);
 			}
 		}
 	}

@@ -13,6 +13,7 @@
 #include "Temp.h"
 #include "BoneConduction.h"
 #include "Microphone.h"
+#include "EchoProfile.h"
 
 #include "openearable_common.h"
 #include "StateIndicator.h"
@@ -39,7 +40,7 @@ EdgeMlSensor * get_sensor(enum sensor_id id);
 
 static sensor_manager_state _state;
 
-K_MSGQ_DEFINE(sensor_queue, sizeof(struct sensor_msg), 256, 4);
+K_MSGQ_DEFINE(sensor_queue, sizeof(struct sensor_msg), 64, 4);
 K_MSGQ_DEFINE(config_queue, sizeof(struct sensor_config), 16, 4);
 
 K_THREAD_STACK_DEFINE(sensor_work_q_stack, CONFIG_SENSOR_WORK_QUEUE_STACK_SIZE);
@@ -170,6 +171,8 @@ EdgeMlSensor * get_sensor(enum sensor_id id) {
 		return &(BoneConduction::sensor);
 	case ID_MICRO:
 		return &(Microphone::sensor);
+	case ID_ECHO:
+		return &(EchoProfile::sensor);
 	default:
 		return NULL;
 	}

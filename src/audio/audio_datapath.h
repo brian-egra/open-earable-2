@@ -106,6 +106,13 @@ void start_data_thread(void);
 
 void record_to_sd(bool active);
 
+void stream_to_ble(bool active);
+
+/* Ultrasound chirp playback + on-device echo profile streaming */
+void chirp_set(bool active);
+
+void echo_stream_set(bool active, uint8_t profiles_avg);
+
 void set_sensor_queue(struct k_msgq *queue);
 
 int audio_datapath_aquire(struct data_fifo *fifo_rx);
